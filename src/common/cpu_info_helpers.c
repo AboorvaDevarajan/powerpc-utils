@@ -209,7 +209,15 @@ static void print_cpu_list(const cpu_set_t *cpuset, int cpuset_size,
 	int core;
 	const char *comma = "";
 
-	for (core = 0; core < cpus_in_system; core++) {
+    int *present_cores = NULL;
+    int num_present_cores;
+
+
+    present_cores = get_present_core_list(threads_per_cpu, &num_present_cores);
+
+    
+    
+	for (core = 0; core < present_cores[num_present_cores-1]; core++) {
 		int begin = core;
 		if (CPU_ISSET_S(core, cpuset_size, cpuset)) {
 			while (CPU_ISSET_S(core+1, cpuset_size, cpuset))
@@ -224,70 +232,176 @@ static void print_cpu_list(const cpu_set_t *cpuset, int cpuset_size,
 	}
 }
 
-int __do_smt(bool numeric, int cpus_in_system, int threads_per_cpu,
-	     bool print_smt_state)
-{
-	int thread, c, smt_state = 0;
-	cpu_set_t **cpu_states = NULL;
-	int cpu_state_size = CPU_ALLOC_SIZE(cpus_in_system);
-	int start_cpu = 0, stop_cpu = cpus_in_system;
-	int rc = 0;
+int *get_present_cpu_list(int *num_cpus) {
+    FILE *fp = fopen(CPU_PRESENT_PATH, "r");
+    if (!fp) {
+        perror("Failed to open the file");
+        exit(EXIT_FAILURE);
+    }
 
-	cpu_states = (cpu_set_t **)calloc(threads_per_cpu, sizeof(cpu_set_t));
-	if (!cpu_states)
-		return -ENOMEM;
+    char line[MAX_NR_CPUS];
+    if (fgets(line, sizeof(line), fp) == NULL) {
+        perror("Failed to read the file");
+        fclose(fp);
+        exit(EXIT_FAILURE);
+    }
+    fclose(fp);
 
-	for (thread = 0; thread < threads_per_cpu; thread++) {
-		cpu_states[thread] = CPU_ALLOC(cpus_in_system);
-		CPU_ZERO_S(cpu_state_size, cpu_states[thread]);
-	}
+    int *cpu_list = malloc(MAX_NR_CPUS * sizeof(int));
+    int count = 0;
+    char *token = strtok(line, ",");
 
-	for (c = start_cpu; c < stop_cpu; c++) {
-		int threads_online = __get_one_smt_state(c, threads_per_cpu);
+    while (token) {
+        int start, end;
+        if (sscanf(token, "%d-%d", &start, &end) == 2) { 
+            for (int i = start; i <= end; i++) {
+                cpu_list[count++] = i;
+            }
+        } else if (sscanf(token, "%d", &start) == 1) {
+            cpu_list[count++] = start;
+        }
+        token = strtok(NULL, ",");
+    }
 
-		if (threads_online < 0) {
-			rc = threads_online;
-			goto cleanup_get_smt;
-		}
-		if (threads_online)
-			CPU_SET_S(c, cpu_state_size,
-					cpu_states[threads_online - 1]);
-	}
+    *num_cpus = count;
+    return cpu_list;
+}
 
-	for (thread = 0; thread < threads_per_cpu; thread++) {
-		if (CPU_COUNT_S(cpu_state_size, cpu_states[thread])) {
-			if (smt_state == 0)
-				smt_state = thread + 1;
-			else if (smt_state > 0)
-				smt_state = 0; /* mix of SMT modes */
-		}
-	}
 
-	if (!print_smt_state)
-		return smt_state;
+int *get_present_core_list(int threads_per_cpu, int *num_cores) {
+    FILE *fp;
+    char cpu_ranges[64];
 
-	if (smt_state == 1) {
-		if (numeric)
-			printf("SMT=1\n");
-		else
-			printf("SMT is off\n");
-	} else if (smt_state == 0) {
-		for (thread = 0; thread < threads_per_cpu; thread++) {
-			if (CPU_COUNT_S(cpu_state_size,
-						cpu_states[thread])) {
-				printf("SMT=%d: ", thread + 1);
-				print_cpu_list(cpu_states[thread],
-						cpu_state_size, cpus_in_system);
-				printf("\n");
-			}
-		}
-	} else {
-		printf("SMT=%d\n", smt_state);
-	}
+    fp = fopen(CPU_PRESENT_PATH, "r");
+    if (fp == NULL) {
+        perror("Failed to open /sys/devices/system/cpu/present");
+        exit(EXIT_FAILURE);
+    }
+
+    if (fgets(cpu_ranges, sizeof(cpu_ranges), fp) == NULL) {
+        perror("Failed to read CPU ranges");
+        fclose(fp);
+        exit(EXIT_FAILURE);
+    }
+    fclose(fp);
+
+    bool core_seen[MAX_NR_CORES] = {0};
+    int *core_list = malloc(MAX_NR_CORES * sizeof(int));
+    int core_count = 0;
+
+    char *range = strtok(cpu_ranges, ",");
+    while (range) {
+        int start, end;
+
+        if (sscanf(range, "%d-%d", &start, &end) == 2) {
+            for (int cpu = start; cpu <= end; cpu++) {
+                int core_id = cpu / threads_per_cpu;
+                if (!core_seen[core_id]) {
+                    core_seen[core_id] = true;
+                    core_list[core_count++] = core_id;
+
+                }
+            }
+        } else if (sscanf(range, "%d", &start) == 1) {
+            int core_id = start / threads_per_cpu;
+            if (!core_seen[core_id]) {
+                core_seen[core_id] = true;
+                core_list[core_count++] = core_id;
+            }
+        }
+
+        range = strtok(NULL, ",");
+    }
+
+    *num_cores = core_count;
+    return core_list;
+}
+
+
+int __do_smt(bool numeric, int cpus_in_system, int threads_per_cpu, bool print_smt_state) {
+    int thread, smt_state = -1;
+    cpu_set_t **cpu_states = NULL;
+    int *present_cores = NULL;
+    int num_present_cores, c, rc = 0;
+
+
+    present_cores = get_present_core_list(threads_per_cpu, &num_present_cores);
+    // Use parse_cpu_present_list to get the list of present CPUs
+
+    if (!present_cores) {
+        rc = -ENOMEM;
+        goto cleanup_get_smt;
+    }
+
+
+    int cpu_state_size = CPU_ALLOC_SIZE(num_present_cores);
+
+
+    // Allocate cpu_states array
+    cpu_states = (cpu_set_t **)calloc(threads_per_cpu, sizeof(cpu_set_t *));
+    if (!cpu_states)
+        return -ENOMEM;
+
+    for (thread = 0; thread < threads_per_cpu; thread++) {
+        cpu_states[thread] = CPU_ALLOC(cpus_in_system);
+        CPU_ZERO_S(cpu_state_size, cpu_states[thread]);
+    }
+
+
+    // Loop over each present CPU
+    printf("num present cores : %d\n", num_present_cores);
+    for (int i = 0; i < num_present_cores; i++) {
+        c = present_cores[i];
+        int threads_online = __get_one_smt_state(c, threads_per_cpu);
+        printf("core: %d threads online : %d\n", c , threads_online);
+        if (threads_online < 0) {
+            rc = threads_online;
+            goto cleanup_get_smt;
+        }
+        if (threads_online) {
+            CPU_SET_S(c, cpu_state_size, cpu_states[threads_online - 1]);
+        }
+    }
+
+
+    /* TODO: this should be anyway fixed even standalone */
+    // Determine the SMT state by counting CPUs in each thread's set
+    for (thread = 0; thread < threads_per_cpu; thread++) {
+        if (CPU_COUNT_S(cpu_state_size, cpu_states[thread])) {
+            printf("hit : threads per cpu : %d\n", thread);
+            if (smt_state == -1)
+                smt_state = thread + 1;
+            else if (smt_state > 0)
+                smt_state = 0; // mixed SMT modes
+        }
+    }
+
+    printf("smt state : %d\n", smt_state);
+    // Print SMT state if requested
+    if (!print_smt_state)
+        return smt_state;
+
+    if (smt_state == 1) {
+        printf("SMT=%d\n", numeric ? 1 : "SMT is off");
+    } else if (smt_state == 0) {
+        for (thread = 0; thread < threads_per_cpu; thread++) {
+            if (CPU_COUNT_S(cpu_state_size, cpu_states[thread])) {
+                printf("SMT=%d: ", thread + 1);
+                print_cpu_list(cpu_states[thread], cpu_state_size, cpus_in_system);
+                printf("\n");
+            }
+        }
+    } else {
+        printf("SMT=%d\n", smt_state);
+    }
 
 cleanup_get_smt:
-	for (thread = 0; thread < threads_per_cpu; thread++)
-		CPU_FREE(cpu_states[thread]);
+    // Free allocated resources
+    for (thread = 0; thread < threads_per_cpu; thread++)
+        CPU_FREE(cpu_states[thread]);
+    free(cpu_states);
+    free(present_cores);
 
-	return rc;
+    return rc;
 }
+
