@@ -1322,6 +1322,11 @@ static int do_info(void) {
     char online;
     int cpus_in_system;
 
+	int subcores = 0;
+
+	if (is_subcore_capable())
+		subcores = num_subcores();
+
     int *cpu_list = get_present_cpu_list(&cpus_in_system);
 
     for (i = 0; i < cpus_in_system; i += threads_per_cpu) {
@@ -1329,7 +1334,14 @@ static int do_info(void) {
 		if (!core_is_online(core))
 			continue;
 
-        printf("Core %3d: ", core);
+
+		if (subcores > 1) {
+			if (core % subcores == 0)
+				printf("Core %3d:\n", core/subcores);
+			printf("  Subcore %3d: ", core);
+		} else {
+			printf("Core %3d: ", core);
+		}
 
         for (j = 0; j < threads_per_cpu; j++) {
             thread_num = i + j;
