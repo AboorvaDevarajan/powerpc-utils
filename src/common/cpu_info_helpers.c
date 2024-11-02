@@ -382,7 +382,7 @@ int __do_smt(bool numeric, int cpus_in_system, int threads_per_cpu, bool print_s
         return smt_state;
 
     if (smt_state == 1) {
-        printf("SMT=%d\n", numeric ? 1 : "SMT is off");
+        printf("SMT=%s\n", numeric ? "1" : "SMT is off");
     } else if (smt_state == 0) {
         for (thread = 0; thread < threads_per_cpu; thread++) {
             if (CPU_COUNT_S(cpu_state_size, cpu_states[thread])) {
