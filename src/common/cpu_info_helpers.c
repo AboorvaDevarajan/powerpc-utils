@@ -203,68 +203,180 @@ int __get_one_smt_state(int core, int threads_per_cpu)
 	return smt_state;
 }
 
-static void print_cpu_list(const cpu_set_t *cpuset, int cpuset_size,
-		           int cpus_in_system)
+static inline int resize_core_list(int **present_cores, int *list_size, int core_count)
 {
-	int core;
-	const char *comma = "";
+    int *temp = NULL;
 
-	for (core = 0; core < cpus_in_system; core++) {
-		int begin = core;
-		if (CPU_ISSET_S(core, cpuset_size, cpuset)) {
-			while (CPU_ISSET_S(core+1, cpuset_size, cpuset))
-				core++;
+    if (core_count >= *list_size) {
+        *list_size *= 2;
+        temp = realloc(*present_cores, *list_size * sizeof(int));
+        if (!temp) {
+            perror("Memory reallocation for present_cores failed");
+            free(*present_cores);
+            return -1;
+        }
+        *present_cores = temp;
+    }
 
-			if (core > begin)
-				printf("%s%d-%d", comma, begin, core);
-			else
-				printf("%s%d", comma, core);
-			comma = ",";
-		}
-	}
+    return 0;
 }
 
-int __do_smt(bool numeric, int cpus_in_system, int threads_per_cpu,
-	     bool print_smt_state)
+int get_present_core_list(int **present_cores, int *num_present_cores, int threads_per_cpu)
 {
-	int thread, c, smt_state = 0;
-	cpu_set_t **cpu_states = NULL;
-	int cpu_state_size = CPU_ALLOC_SIZE(cpus_in_system);
-	int start_cpu = 0, stop_cpu = cpus_in_system;
-	int rc = 0;
+    FILE *fp = NULL;
+    char *line = NULL;
+    char *token = NULL;
+    size_t len;
+    ssize_t read;
+    int i, start, end;
+    int core_id;
+    int core_count = 0, core_list_size = MAX_NR_CORES;
 
-	cpu_states = (cpu_set_t **)calloc(threads_per_cpu, sizeof(cpu_set_t));
-	if (!cpu_states)
+    if (threads_per_cpu <= 0) {
+        fprintf(stderr, "Invalid threads_per_cpu value, got %d expected >= 1\n", threads_per_cpu);
+        return -1;
+    }
+
+    fp = fopen(CPU_PRESENT_PATH, "r");
+    if (!fp) {
+        perror("Error opening file");
+        return -1;
+    }
+
+    read = getline(&line, &len, fp);
+    fclose(fp);
+    if (read == -1) {
+        perror("Error reading file");
+        free(line);
+        return -1;
+    }
+
+    *present_cores = malloc(core_list_size * sizeof(int));
+    if (!*present_cores) {
+        perror("Memory allocation for present_cores list failed");
+        free(line);
+        return -1;
+    }
+
+    token = strtok(line, ",");
+    while (token) {
+        if (sscanf(token, "%d-%d", &start, &end) == 2) {
+            for (i = start; i <= end; i += threads_per_cpu) {
+                core_id = i / threads_per_cpu;
+                if (resize_core_list(present_cores, &core_list_size, core_count) == -1) {
+                    free(line);
+                    return -1;
+                }
+                (*present_cores)[core_count++] = core_id;
+            }
+        } else if (sscanf(token, "%d", &start) == 1) {
+            core_id = start / threads_per_cpu;
+            if (resize_core_list(present_cores, &core_list_size, core_count) == -1) {
+                free(line);
+                return -1;
+            }
+            (*present_cores)[core_count++] = core_id;
+        }
+        token = strtok(NULL, ",");
+    }
+
+    *num_present_cores = core_count;
+
+    free(line);
+    return 0;
+}
+
+static void print_cpu_list(const cpu_set_t *cpuset, int cpuset_size,
+						   int threads_per_cpu)
+{
+	int *present_cores = NULL;
+	int num_present_cores;
+	int start, end, i = 0;
+	const char *comma = "";
+
+	if (get_present_core_list(&present_cores, &num_present_cores, threads_per_cpu) != 0) {
+		fprintf(stderr, "Failed to get present_cores list\n");
+		return;
+	}
+
+	while (i < num_present_cores) {
+		start = present_cores[i];
+		if (CPU_ISSET_S(start, cpuset_size, cpuset)) {
+			end = start;
+			while (i + 1 < num_present_cores &&
+				   CPU_ISSET_S(present_cores[i + 1], cpuset_size, cpuset) &&
+				   present_cores[i + 1] == end + 1) {
+				end = present_cores[++i];
+			}
+			if (start == end) {
+				printf("%s%d", comma, start);
+			} else {
+				printf("%s%d-%d", comma, start, end);
+			}
+			comma = ",";
+		}
+		i++;
+	}
+
+	free(present_cores);
+}
+
+int __do_smt(bool numeric, int cpus_in_system, int threads_per_cpu, bool print_smt_state)
+{
+	cpu_set_t **cpu_states = NULL;
+	int thread, smt_state = -1;
+	int cpu_state_size;
+	int rc = 0;
+	int i, core_id, threads_online;
+	int *present_cores = NULL;
+	int num_present_cores;
+
+	if (get_present_core_list(&present_cores, &num_present_cores, threads_per_cpu) != 0) {
+		fprintf(stderr, "Failed to get present core list\n");
 		return -ENOMEM;
+	}
+
+	cpu_state_size = CPU_ALLOC_SIZE(num_present_cores);
+	cpu_states = (cpu_set_t **)calloc(threads_per_cpu, sizeof(cpu_set_t *));
+	if (!cpu_states) {
+		rc = -ENOMEM;
+		goto cleanup_present_cores;
+	}
 
 	for (thread = 0; thread < threads_per_cpu; thread++) {
-		cpu_states[thread] = CPU_ALLOC(cpus_in_system);
+		cpu_states[thread] = CPU_ALLOC(num_present_cores);
+		if (!cpu_states[thread]) {
+			rc = -ENOMEM;
+			goto cleanup_cpu_states;
+		}
 		CPU_ZERO_S(cpu_state_size, cpu_states[thread]);
 	}
 
-	for (c = start_cpu; c < stop_cpu; c++) {
-		int threads_online = __get_one_smt_state(c, threads_per_cpu);
-
+	for (i = 0; i < num_present_cores; i++) {
+		core_id = present_cores[i];
+		threads_online = __get_one_smt_state(core_id, threads_per_cpu);
 		if (threads_online < 0) {
 			rc = threads_online;
-			goto cleanup_get_smt;
+			goto cleanup_cpu_states;
 		}
-		if (threads_online)
-			CPU_SET_S(c, cpu_state_size,
-					cpu_states[threads_online - 1]);
+		if (threads_online) {
+			CPU_SET_S(core_id, cpu_state_size, cpu_states[threads_online - 1]);
+		}
 	}
 
 	for (thread = 0; thread < threads_per_cpu; thread++) {
 		if (CPU_COUNT_S(cpu_state_size, cpu_states[thread])) {
-			if (smt_state == 0)
+			if (smt_state == -1)
 				smt_state = thread + 1;
 			else if (smt_state > 0)
-				smt_state = 0; /* mix of SMT modes */
+				smt_state = 0; /* Mix of SMT modes */
 		}
 	}
 
-	if (!print_smt_state)
-		return smt_state;
+	if (!print_smt_state) {
+		rc = smt_state;
+		goto cleanup_cpu_states;
+	}
 
 	if (smt_state == 1) {
 		if (numeric)
@@ -273,11 +385,9 @@ int __do_smt(bool numeric, int cpus_in_system, int threads_per_cpu,
 			printf("SMT is off\n");
 	} else if (smt_state == 0) {
 		for (thread = 0; thread < threads_per_cpu; thread++) {
-			if (CPU_COUNT_S(cpu_state_size,
-						cpu_states[thread])) {
+			if (CPU_COUNT_S(cpu_state_size, cpu_states[thread])) {
 				printf("SMT=%d: ", thread + 1);
-				print_cpu_list(cpu_states[thread],
-						cpu_state_size, cpus_in_system);
+				print_cpu_list(cpu_states[thread], cpu_state_size, threads_per_cpu);
 				printf("\n");
 			}
 		}
@@ -285,9 +395,13 @@ int __do_smt(bool numeric, int cpus_in_system, int threads_per_cpu,
 		printf("SMT=%d\n", smt_state);
 	}
 
-cleanup_get_smt:
+cleanup_cpu_states:
 	for (thread = 0; thread < threads_per_cpu; thread++)
 		CPU_FREE(cpu_states[thread]);
+    free(cpu_states);
+
+cleanup_present_cores:
+	free(present_cores);
 
 	return rc;
 }
