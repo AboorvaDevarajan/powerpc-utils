@@ -196,6 +196,8 @@ int __get_one_smt_state(int core, int threads_per_cpu)
 		return -2;
 	}
 
+    printf("get one smt state\n");
+
 	for (i = 0; i < threads_per_cpu; i++) {
 		smt_state += cpu_online(primary_thread + i);
 	}
@@ -203,34 +205,17 @@ int __get_one_smt_state(int core, int threads_per_cpu)
 	return smt_state;
 }
 
-static inline int resize_core_list(int **present_cores, int *list_size, int core_count)
-{
-    int *temp = NULL;
-
-    if (core_count >= *list_size) {
-        *list_size *= 2;
-        temp = realloc(*present_cores, *list_size * sizeof(int));
-        if (!temp) {
-            perror("Memory reallocation for present_cores failed");
-            free(*present_cores);
-            return -1;
-        }
-        *present_cores = temp;
-    }
-
-    return 0;
-}
-
 int get_present_core_list(int **present_cores, int *num_present_cores, int threads_per_cpu)
 {
     FILE *fp = NULL;
     char *line = NULL;
     char *token = NULL;
-    size_t len;
+    size_t len = 0;
     ssize_t read;
-    int i, start, end;
-    int core_id;
-    int core_count = 0, core_list_size = MAX_NR_CORES;
+    int core_count = 0;
+    int core_list_size = 0;
+    int *temp_cores = NULL;
+    int start, end, i, core_id;
 
     if (threads_per_cpu <= 0) {
         fprintf(stderr, "Invalid threads_per_cpu value, got %d expected >= 1\n", threads_per_cpu);
@@ -240,22 +225,31 @@ int get_present_core_list(int **present_cores, int *num_present_cores, int threa
     fp = fopen(CPU_PRESENT_PATH, "r");
     if (!fp) {
         perror("Error opening file");
-        return -1;
+        goto cleanup;
     }
 
     read = getline(&line, &len, fp);
     fclose(fp);
+    fp = NULL;
     if (read == -1) {
         perror("Error reading file");
-        free(line);
-        return -1;
+        goto cleanup;
     }
 
-    *present_cores = malloc(core_list_size * sizeof(int));
-    if (!*present_cores) {
+    token = strtok(line, ",");
+    while (token) {
+        if (sscanf(token, "%d-%d", &start, &end) == 2) {
+            core_list_size += (end - start) / threads_per_cpu + 1;
+        } else if (sscanf(token, "%d", &start) == 1) {
+            core_list_size++;
+        }
+        token = strtok(NULL, ",");
+    }
+
+    temp_cores = malloc(core_list_size * sizeof(int));
+    if (!temp_cores) {
         perror("Memory allocation for present_cores list failed");
-        free(line);
-        return -1;
+        goto cleanup;
     }
 
     token = strtok(line, ",");
@@ -263,27 +257,26 @@ int get_present_core_list(int **present_cores, int *num_present_cores, int threa
         if (sscanf(token, "%d-%d", &start, &end) == 2) {
             for (i = start; i <= end; i += threads_per_cpu) {
                 core_id = i / threads_per_cpu;
-                if (resize_core_list(present_cores, &core_list_size, core_count) == -1) {
-                    free(line);
-                    return -1;
-                }
-                (*present_cores)[core_count++] = core_id;
+                temp_cores[core_count++] = core_id;
             }
         } else if (sscanf(token, "%d", &start) == 1) {
             core_id = start / threads_per_cpu;
-            if (resize_core_list(present_cores, &core_list_size, core_count) == -1) {
-                free(line);
-                return -1;
-            }
-            (*present_cores)[core_count++] = core_id;
+            temp_cores[core_count++] = core_id;
         }
         token = strtok(NULL, ",");
     }
 
+    *present_cores = temp_cores;
     *num_present_cores = core_count;
-
     free(line);
     return 0;
+
+cleanup:
+    if (fp)
+        fclose(fp);
+    free(line);
+    free(temp_cores);
+    return -1;
 }
 
 static void print_cpu_list(const cpu_set_t *cpuset, int cpuset_size,

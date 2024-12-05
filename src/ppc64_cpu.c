@@ -1288,8 +1288,9 @@ static int do_cores_on(char *state)
 		goto cleanup;
 	}
 
-	if (number_to_have > cpus_in_system) {
-		printf("Cannot online more cores than are present.\n");
+	if (number_to_have <= 0 || number_to_have > cpus_in_system) {
+        printf("Error: Invalid number of cores requested: %d, possible values \
+                should be in range: (1-%d)\n", number_to_have, cpus_in_system);
 		do_cores_present();
 		rc = -1;
 		goto cleanup;
