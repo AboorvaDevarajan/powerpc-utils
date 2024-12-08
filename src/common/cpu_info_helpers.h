@@ -24,10 +24,10 @@
 #ifndef _CPU_INFO_HELPERS_H
 #define _CPU_INFO_HELPERS_H
 
-#define SYSFS_CPUDIR    "/sys/devices/system/cpu/cpu%d"
-#define SYSFS_SUBCORES  "/sys/devices/system/cpu/subcores_per_core"
-#define INTSERV_PATH    "/proc/device-tree/cpus/%s/ibm,ppc-interrupt-server#s"
-
+#define SYSFS_CPUDIR      "/sys/devices/system/cpu/cpu%d"
+#define SYSFS_SUBCORES    "/sys/devices/system/cpu/subcores_per_core"
+#define INTSERV_PATH      "/proc/device-tree/cpus/%s/ibm,ppc-interrupt-server#s"
+#define CPU_PRESENT_PATH  "/sys/devices/system/cpu/present"
 #define SYSFS_PATH_MAX	128
 
 extern int __sysattr_is_readable(char *attribute, int threads_in_system);
@@ -39,6 +39,8 @@ extern int num_subcores(void);
 extern int get_attribute(char *path, const char *fmt, int *value);
 extern int get_cpu_info(int *threads_per_cpu, int *cpus_in_system,
 			int *threads_in_system);
+extern int get_present_core_list(int **present_cores, int *num_present_cores,
+			int threads_per_cpu);
 extern int __is_smt_capable(int threads_in_system);
 extern int __get_one_smt_state(int core, int threads_per_cpu);
 extern int __do_smt(bool numeric, int cpus_in_system, int threads_per_cpu,
