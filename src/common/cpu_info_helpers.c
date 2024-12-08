@@ -203,6 +203,113 @@ int __get_one_smt_state(int core, int threads_per_cpu)
 	return smt_state;
 }
 
+int get_present_cpu_count(void)
+{
+        int start, end, total_cpus = 0;
+        size_t len = 0;
+        char *line = NULL;
+        FILE *fp;
+        char *token;
+
+        fp = fopen(CPU_PRESENT_PATH, "r");
+        if (!fp) {
+                perror("Error opening CPU_PRESENT_PATH");
+                return -1;
+        }
+
+        if (getline(&line, &len, fp) == -1) {
+                perror("Error reading CPU_PRESENT_PATH");
+                fclose(fp);
+                free(line);
+                return -1;
+        }
+        fclose(fp);
+
+        token = strtok(line, ",");
+        while (token) {
+                if (sscanf(token, "%d-%d", &start, &end) == 2) {
+                        total_cpus += (end - start + 1);
+                } else if (sscanf(token, "%d", &start) == 1) {
+                        total_cpus++;
+                }
+                token = strtok(NULL, ",");
+        }
+
+        free(line);
+        return total_cpus;
+}
+
+int get_present_core_list(int **present_cores, int *num_present_cores, int threads_per_cpu)
+{
+        FILE *fp = NULL;
+        char *line = NULL;
+        char *token = NULL;
+        size_t len = 0;
+        ssize_t read;
+        int core_count = 0;
+        int core_list_size;
+        int *cores = NULL;
+        int start, end, i;
+
+        if (threads_per_cpu <= 0) {
+                fprintf(stderr, "Invalid threads_per_cpu value, got %d expected >= 1\n", threads_per_cpu);
+                return -1;
+        }
+
+        core_list_size = get_present_cpu_count() / threads_per_cpu;
+        if (core_list_size <= 0) {
+                fprintf(stderr, "Error while calculating core list size\n");
+                return -1;
+        }
+
+        cores = malloc(core_list_size * sizeof(int));
+        if (!cores) {
+                perror("Memory allocation failed");
+                goto cleanup;
+        }
+
+        fp = fopen(CPU_PRESENT_PATH, "r");
+        if (!fp) {
+                perror("Error opening file");
+                goto cleanup;
+        }
+
+        read = getline(&line, &len, fp);
+        if (read == -1) {
+                perror("Error reading file");
+                goto cleanup;
+        }
+
+        token = strtok(line, ",");
+        while (token) {
+                if (sscanf(token, "%d-%d", &start, &end) == 2) {
+                        for (i = start; i <= end; i++) {
+                                if (i % threads_per_cpu == 0) {
+                                        cores[core_count++] = i / threads_per_cpu;
+                                }
+                        }
+                } else if (sscanf(token, "%d", &start) == 1) {
+                        if (start % threads_per_cpu == 0) {
+                                cores[core_count++] = start / threads_per_cpu;
+                        }
+                }
+                token = strtok(NULL, ",");
+        }
+
+        *present_cores = cores;
+        *num_present_cores = core_count;
+        free(line);
+        return 0;
+
+cleanup:
+        if (fp) {
+                fclose(fp);
+        }
+        free(line);
+        free(cores);
+        return -1;
+}
+
 static void print_cpu_list(const cpu_set_t *cpuset, int cpuset_size,
 		           int cpus_in_system)
 {
