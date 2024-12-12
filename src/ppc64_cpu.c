@@ -52,7 +52,6 @@
 
 #define DSCR_DEFAULT_PATH "/sys/devices/system/cpu/dscr_default"
 
-#define MAX_NR_CPUS		1024
 #define DIAGNOSTICS_RUN_MODE	42
 #define CPU_OFFLINE		-1
 
@@ -313,20 +312,36 @@ static int set_smt_state(int smt_state)
 {
 	int i, j, rc = 0;
 	int error = 0;
+	int cpu_base, cpu_id, core_id;
+	int *present_cores = NULL;
+	int num_present_cores;
 
 	if (!sysattr_is_writeable("online")) {
 		perror("Cannot set smt state");
 		return -1;
 	}
 
-	for (i = 0; i < threads_in_system; i += threads_per_cpu) {
+	rc = get_present_core_list(&present_cores, &num_present_cores, threads_per_cpu);
+
+	if (rc != 0) {
+		fprintf(stderr, "Failed to retrieve present core list\n");
+		return rc;
+	}
+
+	for (i = 0; i < num_present_cores; i++) {
+
+		core_id = present_cores[i];
+		cpu_base = core_id * threads_per_cpu;
+
 		/* Online means any thread on this core running, so check all
 		 * threads in the core, not just the first. */
 		for (j = 0; j < threads_per_cpu; j++) {
-			if (!cpu_online(i + j))
+			cpu_id = cpu_base + j;
+
+			if (!cpu_online(cpu_id))
 				continue;
 
-			rc = set_one_smt_state(i, smt_state);
+			rc = set_one_smt_state(cpu_base, smt_state);
 			/* Record an error, but do not check result: if we
 			 * have failed to set this core, keep trying
 			 * subsequent ones. */
@@ -336,10 +351,13 @@ static int set_smt_state(int smt_state)
 		}
 	}
 
+	free(present_cores);
+
 	if (error) {
-		fprintf(stderr, "One or more cpus could not be on/offlined\n");
+		fprintf(stderr, "One or more CPUs could not be on/offlined\n");
 		return -1;
 	}
+
 	return rc;
 }
 
@@ -459,8 +477,8 @@ static int do_subcores_per_core(char *state)
 		}
 		printf("Subcores per core: %d\n", subcore_state);
 	} else {
-                /* Kernel decides what values are valid, so no need to
-                 * check here. */
+		/* Kernel decides what values are valid, so no need to
+		 * check here. */
 		subcore_state = strtol(state, NULL, 0);
 		rc = set_attribute(SYSFS_SUBCORES, "%d", subcore_state);
 		if (rc) {
@@ -1038,7 +1056,7 @@ static int set_all_threads_off(int cpu, int smt_state)
 		snprintf(path, SYSFS_PATH_MAX, SYSFS_CPUDIR"/%s", i, "online");
 		rc = offline_thread(path);
 		if (rc == -1)
-			printf("Unable to take cpu%d offline", i);
+			printf("Unable to take CPU %d offline\n", i);
 	}
 
 	return rc;
@@ -1065,11 +1083,13 @@ static int set_one_core(int smt_state, int core, int state)
 static int do_online_cores(char *cores, int state)
 {
 	int smt_state;
-	int *core_state, *desired_core_state;
+	int *core_state = NULL, *desired_core_state = NULL;
 	int i, rc = 0;
-	int core;
+	int core, valid = 0, core_idx = 0;
 	char *str, *token, *end_token;
 	bool first_core = true;
+	int *present_cores = NULL;
+	int num_present_cores;
 
 	if (cores) {
 		if (!sysattr_is_writeable("online")) {
@@ -1083,49 +1103,62 @@ static int do_online_cores(char *cores, int state)
 		}
 	}
 
+	rc = get_present_core_list(&present_cores, &num_present_cores, threads_per_cpu);
+	if (rc != 0) {
+		fprintf(stderr, "Failed to retrieve present core list\n");
+		return rc;
+	}
+
 	smt_state = get_smt_state();
 
-	core_state = calloc(cpus_in_system, sizeof(int));
-	if (!core_state)
+	core_state = calloc(num_present_cores, sizeof(int));
+	if (!core_state) {
+		free(present_cores);
 		return -ENOMEM;
+	}
 
-	for (i = 0; i < cpus_in_system ; i++)
-		core_state[i] = (get_one_smt_state(i) > 0);
+	for (i = 0; i < num_present_cores; i++) {
+		core_state[i] = (get_one_smt_state(present_cores[i]) > 0);
+	}
 
 	if (!cores) {
 		printf("Cores %s = ", state == 0 ? "offline" : "online");
-		for (i = 0; i < cpus_in_system; i++) {
+		for (i = 0; i < num_present_cores; i++) {
 			if (core_state[i] == state) {
 				if (first_core)
 					first_core = false;
 				else
 					printf(",");
-				printf("%d", i);
+				printf("%d", present_cores[i]);
 			}
 		}
 		printf("\n");
 		free(core_state);
+		free(present_cores);
 		return 0;
 	}
 
 	if (smt_state == -1) {
 		printf("Bad or inconsistent SMT state: use ppc64_cpu --smt=on|off to set all\n"
-                       "cores to have the same number of online threads to continue.\n");
+				"cores to have the same number of online threads to continue.\n");
 		do_info();
+		free(present_cores);
 		return -1;
 	}
 
-	desired_core_state = calloc(cpus_in_system, sizeof(int));
+	desired_core_state = calloc(num_present_cores, sizeof(int));
 	if (!desired_core_state) {
 		free(core_state);
+		free(present_cores);
 		return -ENOMEM;
 	}
 
-	for (i = 0; i < cpus_in_system; i++)
+	for (i = 0; i < num_present_cores; i++) {
 		/*
 		 * Not specified on command-line
 		 */
 		desired_core_state[i] = -1;
+	}
 
 	str = cores;
 	while (1) {
@@ -1141,42 +1174,57 @@ static int do_online_cores(char *cores, int state)
 			rc = -1;
 			continue;
 		}
-		if (core >= cpus_in_system || core < 0) {
+
+		for (i = 0; i < num_present_cores; i++) {
+			if (core == present_cores[i]) {
+				valid = 1;
+				core_idx = i;
+				break;
+			}
+		}
+
+		if (!valid) {
 			printf("Invalid core to %s: %d\n", state == 0 ? "offline" : "online", core);
 			rc = -1;
 			continue;
 		}
-		desired_core_state[core] = state;
+
+		desired_core_state[core_idx] = state;
 	}
 
 	if (rc) {
-		free(core_state);
-		free(desired_core_state);
-		return rc;
+		goto cleanup;
 	}
 
-	for (i = 0; i < cpus_in_system; i++) {
+	for (i = 0; i < num_present_cores; i++) {
 		if (desired_core_state[i] != -1) {
-			rc = set_one_core(smt_state, i, state);
-			if (rc)
+			rc = set_one_core(smt_state, present_cores[i], state);
+			if (rc) {
+				fprintf(stderr, "Failed to set core %d to %s\n", present_cores[i], state == 0 ? "offline" : "online");
 				break;
+			}
 		}
 	}
 
+cleanup:
 	free(core_state);
 	free(desired_core_state);
+	free(present_cores);
+
 	return rc;
 }
 
 static int do_cores_on(char *state)
 {
 	int smt_state;
-	int *core_state;
-	int cores_now_online = 0;
-	int i, rc;
+	int cores_now_online = 0, core_id = 0;
+	int i, rc = 0;
 	int number_to_have, number_to_change = 0, number_changed = 0;
+	int *core_state = NULL;
 	int new_state;
 	char *end_state;
+	int *present_cores = NULL;
+	int num_present_cores;
 
 	if (state) {
 		if (!sysattr_is_writeable("online")) {
@@ -1194,24 +1242,33 @@ static int do_cores_on(char *state)
 	if (!core_state)
 		return -ENOMEM;
 
-	for (i = 0; i < cpus_in_system ; i++) {
-		core_state[i] = (get_one_smt_state(i) > 0);
-		if (core_state[i])
+	rc = get_present_core_list(&present_cores, &num_present_cores, threads_per_cpu);
+	if (rc != 0) {
+		fprintf(stderr, "Failed to retrieve present core list\n");
+		free(core_state);
+		return rc;
+	}
+	for (i = 0; i < num_present_cores; i++) {
+		int core = present_cores[i];
+		core_state[i] = (get_one_smt_state(core) > 0);
+		if (core_state[i]) {
 			cores_now_online++;
+		}
 	}
 
 	if (!state) {
 		printf("Number of cores online = %d\n", cores_now_online);
-		free(core_state);
-		return 0;
+		rc = 0;
+		goto cleanup;
 	}
 
 	smt_state = get_smt_state();
 	if (smt_state == -1) {
 		printf("Bad or inconsistent SMT state: use ppc64_cpu --smt=on|off to set all\n"
-                       "cores to have the same number of online threads to continue.\n");
+			   "cores to have the same number of online threads to continue.\n");
 		do_info();
-		return -1;
+		rc = -1;
+		goto cleanup;
 	}
 
 	if (!strcmp(state, "all")) {
@@ -1227,15 +1284,16 @@ static int do_cores_on(char *state)
 	}
 
 	if (number_to_have == cores_now_online) {
-		free(core_state);
-		return 0;
+		rc = 0;
+		goto cleanup;
 	}
 
-	if (number_to_have > cpus_in_system) {
-		printf("Cannot online more cores than are present.\n");
+	if (number_to_have <= 0 || number_to_have > cpus_in_system) {
+        printf("Error: Invalid number of cores requested: %d, possible values \
+                should be in range: (1-%d)\n", number_to_have, cpus_in_system);
 		do_cores_present();
-		free(core_state);
-		return -1;
+		rc = -1;
+		goto cleanup;
 	}
 
 	if (number_to_have > cores_now_online) {
@@ -1248,41 +1306,50 @@ static int do_cores_on(char *state)
 
 	if (new_state) {
 		for (i = 0; i < cpus_in_system; i++) {
+			core_id = present_cores[i];
 			if (!core_state[i]) {
-				rc = set_one_core(smt_state, i, new_state);
-				if (!rc)
+				rc = set_one_core(smt_state, core_id, new_state);
+				if (!rc) {
 					number_changed++;
-				if (number_changed >= number_to_change)
+				}
+				if (number_changed >= number_to_change) {
 					break;
+				}
 			}
 		}
 	} else {
-		for (i = cpus_in_system - 1; i > 0; i--) {
+		for (i = cpus_in_system - 1; i >= 0; i--) {
+			core_id = present_cores[i];
 			if (core_state[i]) {
-				rc = set_one_core(smt_state, i, new_state);
-				if (!rc)
+				rc = set_one_core(smt_state, core_id, new_state);
+				if (!rc) {
 					number_changed++;
-				if (number_changed >= number_to_change)
+				}
+				if (number_changed >= number_to_change) {
 					break;
+				}
 			}
 		}
 	}
 
 	if (number_changed != number_to_change) {
 		cores_now_online = 0;
-		for (i = 0; i < cpus_in_system ; i++) {
-			if (cpu_online(i * threads_per_cpu))
+		for (i = 0; i < cpus_in_system; i++) {
+			core_id = present_cores[i];
+			if (cpu_online(core_id * threads_per_cpu)) {
 				cores_now_online++;
+			}
 		}
 		printf("Failed to set requested number of cores online.\n"
-                       "Requested: %d cores, Onlined: %d cores\n",
-                       number_to_have, cores_now_online);
-		free(core_state);
-		return -1;
+			   "Requested: %d cores, Onlined: %d cores\n",
+			   number_to_have, cores_now_online);
+		rc = -1;
 	}
 
+cleanup:
 	free(core_state);
-	return 0;
+	free(present_cores);
+	return rc;
 }
 
 static bool core_is_online(int core)
@@ -1294,35 +1361,45 @@ static int do_info(void)
 {
 	int i, j, thread_num;
 	char online;
-	int core, subcores = 0;
+	int subcores = 0, core_id = 0;
+	int *present_cores = NULL;
+	int num_present_cores;
 
-	if (is_subcore_capable())
+	if (is_subcore_capable()) {
 		subcores = num_subcores();
+	}
 
-	for (i = 0, core = 0; core < cpus_in_system; i++) {
+	int rc = get_present_core_list(&present_cores, &num_present_cores, threads_per_cpu);
+	if (rc != 0) {
+		fprintf(stderr, "Failed to retrieve present core list\n");
+		return rc;
+	}
 
-		if (!core_is_online(i))
+	for (i = 0; i < num_present_cores; i++) {
+		core_id = present_cores[i];
+		if (!core_is_online(core_id)) {
 			continue;
-
-		if (subcores > 1) {
-			if (core % subcores == 0)
-				printf("Core %3d:\n", core/subcores);
-			printf("  Subcore %3d: ", core);
-		} else {
-			printf("Core %3d: ", core);
 		}
 
-		thread_num = i * threads_per_cpu;
-		for (j = 0; j < threads_per_cpu; j++, thread_num++) {
+		if (subcores > 1) {
+			if (core_id % subcores == 0) {
+				printf("Core %3d:\n", core_id / subcores);
+			}
+			printf("  Subcore %3d: ", core_id);
+		} else {
+			printf("Core %3d: ", core_id);
+		}
+
+		for (j = 0; j < threads_per_cpu; j++) {
+			thread_num = core_id * threads_per_cpu + j;
 			online = cpu_online(thread_num) ? '*' : ' ';
 			printf("%4d%c ", thread_num, online);
 		}
 		printf("\n");
-		core++;
 	}
+	free(present_cores);
 	return 0;
 }
-
 static void usage(void)
 {
 	printf(
